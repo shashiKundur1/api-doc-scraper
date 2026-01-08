@@ -24,3 +24,6 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 trafilatura
 tiktoken
+pydantic
+PyYAML
+requests
