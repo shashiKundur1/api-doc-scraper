@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+
+# Environment Variables (CRITICAL: Never commit API keys)
+.env
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+
+# OS specific
+.DS_Store
+
+# Output directory (Optional: if you don't want to track generated files)
+# output/*
+# !output/.gitkeep
