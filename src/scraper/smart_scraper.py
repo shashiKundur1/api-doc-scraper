@@ -1,83 +1,206 @@
 import asyncio
 from playwright.async_api import async_playwright
 from src.utils.logger import logger
-from src.ai.selector_agent import SelectorAgent
+from urllib.parse import urljoin, urlparse
 
 class SmartScraper:
-    async def scrape(self, url: str):
+    async def scrape(self, base_url: str):
+        """
+        Robust Scraper: Collects URLs (including anchors) and visits them.
+        """
         async with async_playwright() as p:
-            # 1. Launch & Navigate
+            # 1. Setup
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            logger.info(f"🚀 Navigating to {url}...")
-            await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000) # Wait for render
+            context = await browser.new_context(viewport={"width": 1600, "height": 1200}) 
+            page = await context.new_page()
+            
+            logger.info(f"🚀 Initializing: {base_url}...")
+            
+            # Extract domain for lenient filtering
+            parsed_base = urlparse(base_url)
+            base_domain = parsed_base.netloc.replace("www.", "")
+            
+            try:
+                await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(3000) 
+            except Exception as e:
+                logger.error(f"   ❌ Initial navigation failed: {e}")
+                await browser.close()
+                return []
 
-            # 2. Get Selectors (AI + Fallback)
-            # We skip the AI step for now to ensure we use the KNOWN GOOD selectors from your debug
-            # In a real universal app, we'd keep the AI, but for this specific request, we hardcode reliability.
+            # --- PHASE 1: COLLECT URLs ---
+            logger.info("🕵️‍♀️ Phase 1: Collecting Navigation Links...")
             
-            selectors = {
-                "sidebar": "#toc .toc-link",  # Proven by logs
-                "content": ".content",        # Proven by logs
-                "code": "pre.highlight",      # Proven by logs
-                "params": "table, ul, .parameters" # General best guess
-            }
+            sidebar_selectors = [
+                "nav a", "aside a", "#toc a", ".navigation a", 
+                "div[class*='sidebar'] a", "div[class*='menu'] a",
+                "ul a", "li a"
+            ]
             
-            logger.info(f"Using Proven Selectors: {selectors}")
+            found_links = []
+            
+            # 1. Find Sidebar
+            for sel in sidebar_selectors:
+                elements = await page.locator(sel).all()
+                if len(elements) > 5:
+                    logger.success(f"   ✅ Found sidebar using: '{sel}' ({len(elements)} items)")
+                    found_links = elements
+                    break
+            
+            # 2. Fallback
+            if len(found_links) < 5:
+                logger.warning("   ⚠️ Sidebar weak. Switching to GREEDY search.")
+                found_links = await page.locator("a").all()
 
-            # 3. Scrape
-            # A. Get all Sidebar Links
-            links = await page.locator(selectors["sidebar"]).all()
-            logger.info(f"Found {len(links)} navigation items.")
-
-            results = []
+            # 3. Process Links
+            urls_to_visit = []
+            seen_urls = set()
             
-            # Iterate through unique links (deduplicate by text)
-            seen_sections = set()
+            logger.info("   🔍 filtering links...")
             
-            # Limit to first 10 for testing speed, remove [:10] for full run
-            for i, link in enumerate(links): 
+            for link in found_links:
                 try:
+                    href = await link.get_attribute("href")
                     text = await link.inner_text()
-                    section_name = text.strip()
                     
-                    if not section_name or section_name in seen_sections: continue
-                    seen_sections.add(section_name)
+                    if not href or not text: continue
                     
-                    logger.info(f"➡️ Visiting: {section_name}")
-                    
-                    # Force click to handle overlays
-                    await link.click(force=True)
-                    await page.wait_for_timeout(1000) # Fast wait for hydration
+                    text = text.strip()
+                    # FIX: Allow hash links for Single Page Apps (SPA)
+                    if href.startswith(("#", "/")):
+                        full_url = urljoin(base_url, href)
+                    else:
+                        full_url = href
 
-                    # B. Extract Content
-                    # Scoping to .content ensures we don't grab the sidebar text by accident
-                    content_area = page.locator(selectors["content"])
+                    # --- FILTERS ---
+                    if len(text) < 2: continue 
+                    if full_url in seen_urls: continue
+                    # FIX: removed '#' from ignored prefixes
+                    if href.startswith(("javascript", "mailto", "tel")): continue
                     
-                    # 1. Capture Code Blocks (The critical part)
-                    code_blocks = []
-                    # Try specific 'pre.highlight' first (Slate theme standard)
-                    pres = await content_area.locator(selectors["code"]).all()
-                    for pre in pres:
-                        code_text = await pre.inner_text()
-                        if code_text and len(code_text) > 10:
-                            code_blocks.append(code_text)
+                    # Domain Check
+                    if base_domain not in full_url:
+                        # logger.warning(f"      Skipping external link: {text} -> {full_url}")
+                        continue
                     
-                    # 2. Capture Text Content (for the AI to process later)
+                    seen_urls.add(full_url)
+                    urls_to_visit.append({"url": full_url, "title": text})
+                except: pass
+
+            logger.info(f"   📊 Collected {len(urls_to_visit)} unique pages/sections to scrape.")
+
+            # --- PHASE 2: VISIT & SCRAPE ---
+            results = []
+            content_selector = "#content-area" 
+
+            for i, item in enumerate(urls_to_visit): 
+                url = item["url"]
+                title = item["title"]
+                
+                try:
+                    logger.info(f"[{i+1}/{len(urls_to_visit)}] 🚀 Visiting: {title}")
+                    
+                    try:
+                        # Handle hash navigation vs full page load
+                        if "#" in url and url.split("#")[0] == page.url.split("#")[0]:
+                            # Just click if it's on the same page (faster/safer for SPA)
+                            # Try to find the link again to click it
+                            await page.goto(url, wait_until="domcontentloaded")
+                        else:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        
+                        await page.wait_for_timeout(1000) 
+                    except:
+                        continue
+
+                    # 1. Find Content
+                    content_area = page.locator(content_selector).first
+                    if not await content_area.is_visible():
+                        content_area = page.locator("main").first
+                    if not await content_area.is_visible():
+                        content_area = page.locator("body").first
+
+                    # 2. Click Interactive Elements
+                    await self._click_interactive_elements(content_area, page)
+
+                    # 3. Extract Code
+                    code_blocks = await self._extract_code_via_copy_buttons(content_area)
+                    
+                    # 4. Extract Text
                     full_text = await content_area.inner_text()
-                    
-                    # Store result
+
                     results.append({
-                        "section": section_name,
-                        "raw_text": full_text,     # Main description + params
-                        "code_samples": code_blocks # Explicit code snippets
+                        "section": title,
+                        "raw_text": full_text,
+                        "code_samples": code_blocks 
                     })
                     
-                    logger.success(f"   ✅ Extracted {len(code_blocks)} code blocks from {section_name}")
+                    logger.success(f"      ✅ Captured {len(code_blocks)} code snippets")
 
                 except Exception as e:
-                    logger.warning(f"   ⚠️ Failed section: {e}")
+                    logger.error(f"      ❌ Failed to process {title}: {e}")
 
             await browser.close()
             return results
+
+    async def _click_interactive_elements(self, content_area, page):
+        keywords = ["200", "201", "400", "401", "403", "404", "500", "cURL", "JSON", "Response", "Request", "Body"]
+        for word in keywords:
+            try:
+                candidates = await content_area.locator(f"text={word}").all()
+                for el in candidates:
+                    if await el.is_visible():
+                        txt = await el.inner_text()
+                        if len(txt) < 15: 
+                            await el.click(force=True, timeout=500)
+                            await page.wait_for_timeout(100)
+            except: pass
+
+    async def _extract_code_via_copy_buttons(self, content_area):
+        collected_code = []
+        unique_codes = set()
+
+        copy_buttons = await content_area.locator("text=Copy").all()
+        if not copy_buttons:
+            copy_buttons = await content_area.locator("button[aria-label*='copy' i]").all()
+
+        for btn in copy_buttons:
+            try:
+                if not await btn.is_visible(): continue
+                
+                btn_handle = await btn.element_handle()
+                
+                code_text = await btn_handle.evaluate("""(btn) => {
+                    let sibling = btn.nextElementSibling;
+                    while(sibling) {
+                        if (sibling.tagName === 'PRE') return sibling.innerText;
+                        sibling = sibling.nextElementSibling;
+                    }
+                    let parent = btn.parentElement;
+                    let depth = 0;
+                    while(parent && depth < 4) {
+                        let pre = parent.querySelector('pre');
+                        if (pre) return pre.innerText;
+                        parent = parent.parentElement;
+                        depth++;
+                    }
+                    return null;
+                }""")
+
+                if code_text and len(code_text) > 5 and code_text not in unique_codes:
+                    unique_codes.add(code_text)
+                    lang = "bash" if "curl" in code_text.lower() else "json" if "{" in code_text else "text"
+                    collected_code.append({"language": lang, "code": code_text})
+            except: pass
+
+        # Fallback
+        pres = await content_area.locator("pre").all()
+        for pre in pres:
+            try:
+                text = await pre.inner_text()
+                if text and text not in unique_codes:
+                    unique_codes.add(text)
+                    collected_code.append({"language": "default", "code": text})
+            except: pass
+
+        return collected_code
